@@ -1,0 +1,67 @@
+-- написано на PostgreSQL
+
+
+WITH 
+  -- условия выполнения первого события в сессии
+  session_start AS (
+    SELECT "USER_ID", "EVENT_DTM","EVENT_NAME",
+      CASE 
+        WHEN "EVENT_NAME" = 'session_start' THEN 1
+        WHEN LAG("EVENT_NAME") OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM") = 'session_end' THEN 1
+        WHEN EXTRACT(EPOCH FROM "EVENT_DTM"::timestamp - LAG("EVENT_DTM"::timestamp) OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM")) > 1800 THEN 1
+        WHEN DATE_TRUNC('day', "EVENT_DTM"::timestamp ) != DATE_TRUNC('day', LAG("EVENT_DTM"::timestamp ) OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM")) THEN 1
+        WHEN ROW_NUMBER() OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM") = 1 THEN 1
+        ELSE 0
+      END AS is_session_start
+      FROM
+        events
+  ),
+  
+  -- ищем все сессии в session_start
+  all_sessions AS (
+    SELECT 
+      "USER_ID", "EVENT_DTM" AS SESSION_START_DTM,
+      LEAD("EVENT_DTM") OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM") AS SESSION_END_DTM,
+      ROW_NUMBER() OVER (PARTITION BY "USER_ID" ORDER BY "EVENT_DTM") AS SESSION_NUMBER
+    FROM 
+      session_start
+    WHERE 
+      is_session_start = 1
+  ),
+  
+  -- отделяем сессии только с session_start и с session_end от всех остальных
+  filtered_sessions AS (
+    SELECT 
+      s."USER_ID", s.SESSION_START_DTM, s.SESSION_END_DTM, s.SESSION_NUMBER,
+      COUNT(CASE WHEN e."EVENT_NAME" NOT IN ('session_start', 'session_end') THEN 1 END) 
+      OVER (PARTITION BY s."USER_ID", s.SESSION_NUMBER) AS has_no_session_events
+    FROM 
+      all_sessions s
+    JOIN 
+      events e ON s."USER_ID" = e."USER_ID" AND e."EVENT_DTM" BETWEEN s.SESSION_START_DTM AND s.SESSION_END_DTM
+  ),
+  
+  -- проверяем является ли пользователь клиентом 'purchase'
+  client_sessions AS (
+    SELECT 
+      f_s."USER_ID",
+      f_s.SESSION_START_DTM,
+      f_s.SESSION_END_DTM,
+      f_s.SESSION_NUMBER,
+      f_s.has_no_session_events,
+      BOOL_OR(e."EVENT_NAME" = 'purchase') OVER (PARTITION BY f_s."USER_ID") AS IS_CLIENT
+    FROM 
+      filtered_sessions f_s
+    JOIN 
+      events e ON f_s."USER_ID" = e."USER_ID"
+  )
+
+-- выводим select-ом финальную таблицу сессий всех пользователей 
+SELECT 
+  ROW_NUMBER() OVER (ORDER BY "USER_ID", SESSION_START_DTM) AS SESSION_ID,
+  cs."USER_ID", cs.SESSION_START_DTM, cs.SESSION_END_DTM,
+  cs.SESSION_NUMBER, cs.IS_CLIENT
+FROM 
+  client_sessions cs
+WHERE 
+  cs.has_no_session_events > 0;
